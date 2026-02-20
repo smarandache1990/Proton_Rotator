@@ -4,48 +4,41 @@ Overview
 This script automates rotating between ProtonVPN servers with a simple CLI for control. It runs as a background daemon, switching servers on a timer, and provides commands to manage lists, adjust timing, and control the rotation.
 Step 1: Prerequisites
 1.1 Install ProtonVPN CLI
-bash
+
 
 # On Debian/Ubuntu
 sudo apt update
-sudo apt install protonvpn-cli
+sudo apt install protonvpn
 
 # On Fedora/RHEL
-sudo dnf install protonvpn-cli
+sudo dnf install protonvpn
 
 # On Arch
-sudo pacman -S protonvpn-cli
+sudo pacman -S protonvpn
 
 1.2 Log in to ProtonVPN
-bash
 
-protonvpn-cli login [your_username]
+
+protonvpn login [your_username]
 # Follow prompts for password
 
 1.3 Verify Installation
-bash
 
-protonvpn-cli status  # Should show "Not connected"
-protonvpn-cli s       # List available servers
+# Should return account info
+protonvpn info
 
 Step 2: Setup Script
-2.1 Download/Create Script
-
-Save the Python script from the previous response as pvpn-rotator.py:
-bash
-
-nano pvpn-rotator.py
-# Paste the entire script, then save (Ctrl+X, Y, Enter)
+2.1 Download/Clone repo
 
 2.2 Make Script Executable
-bash
+
 
 chmod +x pvpn-rotator.py
 
 2.3 Create Default Configuration
 
 Run the script once to generate config files:
-bash
+
 
 ./pvpn-rotator.py status
 
@@ -59,13 +52,13 @@ Step 3: Configure Server Lists
 3.1 Find Server IDs
 
 Get available server IDs from ProtonVPN:
-bash
 
-protonvpn-cli s | grep -E '^\w+-\w+.*#' | head -10
-# Example output: US-FREE#1, CA#5, CH-10, JP#3, etc.
+I have included a complete lists of Secure Core Servers along with Proton Plus Servers.
+I have chosen list A to be my Secure Core list and list B as my Proton Plus Servers but you can swap them if you would like
+
 
 3.2 Edit Your Lists
-bash
+
 
 # Edit list A
 nano ~/.config/pvpn-rotator/list_a.txt
@@ -82,19 +75,19 @@ CH-10
 
 Step 4: Autostart Setup (Optional but Recommended)
 4.1 Install Systemd Service
-bash
+
 
 ./pvpn-rotator.py install-service
 
 4.2 Enable & Start Service
-bash
+
 
 systemctl --user daemon-reload
 systemctl --user enable pvpn-rotator.service
 systemctl --user start pvpn-rotator.service
 
 4.3 Verify Service Status
-bash
+
 
 systemctl --user status pvpn-rotator.service
 # Should show "active (running)"
@@ -103,7 +96,7 @@ journalctl --user -u pvpn-rotator.service -f
 
 Step 5: Basic Usage
 5.1 Start Rotation (If not using systemd)
-bash
+
 
 ./pvpn-rotator.py start
 
@@ -116,7 +109,7 @@ The daemon will:
     Repeat
 
 5.2 Check Status
-bash
+
 
 ./pvpn-rotator.py status
 
@@ -129,7 +122,7 @@ Shows:
     Connected VPN server
 
 5.3 Stop Rotation
-bash
+
 
 ./pvpn-rotator.py stop
 # Or if using systemd:
@@ -137,7 +130,7 @@ systemctl --user stop pvpn-rotator.service
 
 Step 6: Control Commands
 6.1 Switch Between Lists
-bash
+
 
 # Switch to list B
 ./pvpn-rotator.py switch B
@@ -146,7 +139,7 @@ bash
 ./pvpn-rotator.py switch A
 
 6.2 Adjust Rotation Interval
-bash
+
 
 # Change to 15 minutes per server
 ./pvpn-rotator.py interval 15
@@ -158,7 +151,7 @@ bash
 ./pvpn-rotator.py interval 60
 
 6.3 Pause/Resume
-bash
+
 
 # Pause rotation (stay on current server)
 ./pvpn-rotator.py pause
@@ -167,14 +160,14 @@ bash
 ./pvpn-rotator.py resume
 
 6.4 Manual Skip
-bash
+
 
 # Skip to next server immediately
 ./pvpn-rotator.py skip
 
 Step 7: List Management Commands
 7.1 View Lists
-bash
+
 
 # Show all servers in list A
 ./pvpn-rotator.py list A
@@ -183,7 +176,7 @@ bash
 ./pvpn-rotator.py list B
 
 7.2 Search Lists
-bash
+
 
 # Search list A for "free" servers
 ./pvpn-rotator.py search A free
@@ -192,7 +185,7 @@ bash
 ./pvpn-rotator.py search B JP
 
 7.3 Add/Remove Servers
-bash
+
 
 # Add server to list A
 ./pvpn-rotator.py add A US-FREE#2
@@ -201,7 +194,7 @@ bash
 ./pvpn-rotator.py remove B CA#5
 
 7.4 Find and Replace
-bash
+
 
 # Replace all "FREE" with "PLUS" in list A
 ./pvpn-rotator.py replace A FREE PLUS
@@ -211,19 +204,19 @@ bash
 
 Step 8: Monitoring & Logs
 8.1 View Live Rotation
-bash
+
 
 # Tail the log file
 tail -f ~/.config/pvpn-rotator/daemon.log
 
 8.2 Check Current VPN Connection
-bash
 
-protonvpn-cli status
+
+protonvpn status
 # Should show connected server and timestamp
 
 8.3 Verify IP Rotation
-bash
+
 
 # Quick check of public IP
 curl ifconfig.me
@@ -233,28 +226,28 @@ curl ipinfo.io
 Step 9: Troubleshooting
 9.1 Common Issues
 
-"protonvpn-cli: command not found"
-bash
+"protonvpn: command not found"
+
 
 # Ensure it's installed and in PATH
-which protonvpn-cli
+which protonvpn
 # If not found, check installation
-sudo apt install --reinstall protonvpn-cli
+sudo apt install --reinstall protonvpn
 
 "Failed to connect" errors
-bash
+
 
 # Check login status
-protonvpn-cli status
+protonvpn status
 
 # Try manual connection
-protonvpn-cli connect US-FREE#1
+protonvpn connect US-FREE#1
 
 # Verify server exists in ProtonVPN's list
-protonvpn-cli s | grep "US-FREE#1"
+protonvpn s | grep "US-FREE#1"
 
 Daemon not starting
-bash
+
 
 # Check if already running
 ps aux | grep pvpn-rotator
@@ -270,7 +263,7 @@ rm ~/.config/pvpn-rotator/control.fifo
 ./pvpn-rotator.py start
 
 Systemd service issues
-bash
+
 
 # Check logs
 journalctl --user -u pvpn-rotator.service -n 50
@@ -282,7 +275,7 @@ systemctl --user daemon-reload
 systemctl --user restart pvpn-rotator.service
 
 9.2 Reset Configuration
-bash
+
 
 # Stop daemon first
 ./pvpn-rotator.py stop
@@ -311,20 +304,20 @@ json
 10.2 Multiple Instances
 
 For multiple rotation profiles, copy the script:
-bash
+
 
 cp pvpn-rotator.py pvpn-work.py
 # Edit config path in script to different directory
 
 10.3 Integration with Other Tools
-bash
+
 
 # Script to notify on server change
 echo 'Server changed to $1' | notify-send "VPN Rotator"
 # Add to script after connection successful
 
 Quick Reference Cheat Sheet
-bash
+
 
 # START/STOP
 ./pvpn-rotator.py start          # Start daemon
@@ -348,17 +341,17 @@ systemctl --user enable pvpn-rotator.service  # Enable autostart
 # MONITORING
 ./pvpn-rotator.py status         # Current status
 tail -f ~/.config/pvpn-rotator/daemon.log  # Live logs
-protonvpn-cli status             # VPN connection status
+protonvpn status             # VPN connection status
 
 Example Workflow
 
     Initial Setup
 
-bash
 
-# Install protonvpn-cli and login
-sudo apt install protonvpn-cli
-protonvpn-cli login myusername
+
+# Install protonvpn and login
+sudo apt install protonvpn
+protonvpn login myusername
 
 # Setup rotation script
 wget https://example.com/pvpn-rotator.py
@@ -375,7 +368,7 @@ systemctl --user enable --now pvpn-rotator.service
 
     Daily Use
 
-bash
+
 
 # Check status
 ./pvpn-rotator.py status
@@ -393,10 +386,10 @@ bash
 
     Maintenance
 
-bash
+
 
 # Add new servers found
-protonvpn-cli s | grep "Singapore"
+protonvpn s | grep "Singapore"
 # Output: SG#5
 ./pvpn-rotator.py add A SG#5
 
@@ -409,7 +402,7 @@ tail -100 ~/.config/pvpn-rotator/daemon.log
 Security Notes
 
     Permissions: The script runs under your user account, not root
-    Credentials: ProtonVPN credentials are handled by protonvpn-cli
+    Credentials: ProtonVPN credentials are handled by protonvpn
     Logs: Connection logs stored locally in ~/.config/pvpn-rotator/
     Network: Ensure firewall allows ProtonVPN ports (default UDP 1194/443)
 
