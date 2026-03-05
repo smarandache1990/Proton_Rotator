@@ -1,22 +1,38 @@
-ProtonVPN Server Rotator - Complete Walkthrough
+ProtonVPN Server Rotator - Complete Walkthrough - https://protonvpn.com/support/official-linux-vpn-debian
 Overview
 
 This script automates rotating between ProtonVPN servers with a simple CLI for control. It runs as a background daemon, switching servers on a timer, and provides commands to manage lists, adjust timing, and control the rotation.
-Step 1: Prerequisites
-1.1 Install ProtonVPN CLI
+
+# Step 1: Prerequisites
+## Get the Repo
+1. Download the package that contains the repository configuration and keys required to install the Proton VPN app. Enter:
+
+wget https://repo.protonvpn.com/debian/dists/stable/main/binary-all/protonvpn-stable-release_1.0.8_all.deb
+
+2. Install the Proton VPN repository containing the app. Enter:
+
+sudo dpkg -i ./protonvpn-stable-release_1.0.8_all.deb && sudo apt update
+
+Please don’t try  to check the GPG signature of this release package (dpkg-sig –verify). Our internal release process is split into several parts; the release package is signed with a GPG key, and the repo is signed with another GPG key. So the keys don’t match.
+
+If you want to check the repo package’s integrity, you can verify its checksum with the following command:
+
+echo "0b14e71586b22e498eb20926c48c7b434b751149b1f2af9902ef1cfe6b03e180 protonvpn-stable-release_1.0.8_all.deb" | sha256sum --check -
+
+## 1.1 Install ProtonVPN CLI
 
 
-# On Debian/Ubuntu
+### On Debian/Ubuntu
 sudo apt update
-sudo apt install protonvpn
+sudo apt install proton-vpn-cli
 
-# On Fedora/RHEL
-sudo dnf install protonvpn
+### On Fedora/RHEL
+sudo dnf install proton-vpn-cli
 
-# On Arch
-sudo pacman -S protonvpn
+### On Arch
+sudo pacman -S proton-vpn-cli
 
-1.2 Log in to ProtonVPN
+## 1.2 Log in to ProtonVPN
 
 
 protonvpn login [your_username]
@@ -72,6 +88,15 @@ US-FREE#1
 CA#5
 NL-FREE#1
 CH-10
+
+## I have already generated the lists
+### You just need to copy the lists over to ~/.config/pvpn-rotator/
+
+Navigate to the location of the Git Clone Repo
+
+cp Secure\ Core\ servers.txt ~/.config/pvpn-rotator/list_a.txt
+
+cp Proton\ VPN\ Plus\ Servers.txt ~/.config/pvpn-rotator/list_b.txt
 
 Step 4: Autostart Setup (Optional but Recommended)
 4.1 Install Systemd Service
