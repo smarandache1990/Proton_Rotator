@@ -1,485 +1,681 @@
 #!/usr/bin/env python3
 """
-ProtonVPN Server Rotator Daemon & CLI
-Manages two server lists, rotates connections on a timer.
-Control via system signals or command file.
-"""
+pvpn-rotator - rotate Proton VPN OpenVPN tunnels on a timer. Linux + Windows.
 
+Setup:
+  1. account.protonvpn.com -> Account -> OpenVPN username. Put user + pass,
+     one per line, in <config>/credentials  (NOT your account password).
+  2. Download per-server .ovpn files from Downloads -> OpenVPN configuration
+     files, correct platform, UDP. Linux: ovpn/linux/   Windows: ovpn/windows/
+  3. pvpn-rotator.py init
+  4. pvpn-rotator.py interval 10
+  5. pvpn-rotator.py install-service
+
+Control needs no admin: pvpn-rotator.py next | pause | resume | stop | interval N | status
+"""
+import argparse
+import ctypes
+import json
 import os
+import random
+import re
+import shutil
+import signal
+import socket
+import subprocess
 import sys
 import time
-import signal
-import json
-import threading
+import urllib.request
+from datetime import datetime
 from pathlib import Path
-from subprocess import run, PIPE, CalledProcessError
-from datetime import datetime, timedelta
 
-# --- Configuration Paths ---
-CONFIG_DIR = Path.home() / ".config" / "pvpn-rotator"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-LIST_A_FILE = CONFIG_DIR / "list_a.txt" 
-LIST_B_FILE = CONFIG_DIR / "list_b.txt"
-CONTROL_FILE = CONFIG_DIR / "control.fifo"  # Named pipe for commands
-PID_FILE = CONFIG_DIR / "daemon.pid"
-LOG_FILE = CONFIG_DIR / "daemon.log"
+WIN = sys.platform == "win32"
+PLATFORM = "windows" if WIN else "linux"
 
-# Default configuration
-DEFAULT_CONFIG = {
-    "active_list": "A",  # "A" or "B"
-    "switch_interval_minutes": 10,
-    "current_index": 0,
-    "running": False,
-    "paused": False
+if WIN:
+    BASE = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "pvpn-rotator"
+    ETC = VAR = BASE
+    NO_WINDOW = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+else:
+    ETC = Path("/etc/pvpn-rotator")
+    VAR = Path("/var/lib/pvpn-rotator")
+    NO_WINDOW = 0
+
+OVPN_DIR = ETC / "ovpn" / PLATFORM
+CONF = ETC / "config.json"
+CREDS = ETC / "credentials"
+STATE = VAR / "state.json"
+LOG = VAR / "rotator.log"
+OVPN_LOG = VAR / "openvpn.log"
+CMD = VAR / "command"
+RESOLV = Path("/etc/openvpn/update-resolv-conf")
+
+DEFAULTS = {
+    "interval_minutes": 10,
+    "connect_timeout": 45,
+    "verify_ip": True,
+    "killswitch": False,
+    "order": "sequential",       # or "random"
+    "dev_node": "OpenVPN TAP-Windows6" if WIN else "",
+    "tun_iface": "OpenVPN TAP-Windows6" if WIN else "tun*",
 }
 
-# --- Configuration Management ---
-def load_config():
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    if not CONFIG_FILE.exists():
-        save_config(DEFAULT_CONFIG)
-        # Create example list files if they don't exist
-        if not LIST_A_FILE.exists():
-            LIST_A_FILE.write_text("US-FREE#1\nCA#5\nNL-FREE#1\n")
-        if not LIST_B_FILE.exists():
-            LIST_B_FILE.write_text("JP#3\nSG#5\nHK#2\n")
-    try:
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        return DEFAULT_CONFIG.copy()
+ADMIN_CMDS = {"daemon", "init", "install-service"}
 
-def save_config(config):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
+_child = None
+_mgmt = None
+_stop = False
 
-# --- Server List Management ---
-def get_active_list(config):
-    """Returns list of servers from the active list file."""
-    list_file = LIST_A_FILE if config["active_list"] == "A" else LIST_B_FILE
-    if not list_file.exists():
-        return []
-    servers = list_file.read_text().strip().splitlines()
-    return [s.strip() for s in servers if s.strip()]
 
-def update_list(list_name, servers):
-    """Overwrites list A or B with new server entries."""
-    list_file = LIST_A_FILE if list_name.upper() == "A" else LIST_B_FILE
-    list_file.write_text("\n".join(servers) + "\n")
+# ---------------------------------------------------------------- binary lookup
+def _version_key(path):
+    parts = re.findall(r"\d+", path.parent.parent.name)
+    return [int(p) for p in parts] or [0]
 
-def search_list(list_name, pattern):
-    """Returns servers matching pattern (case-insensitive substring)."""
-    list_file = LIST_A_FILE if list_name.upper() == "A" else LIST_B_FILE
-    if not list_file.exists():
-        return []
-    servers = list_file.read_text().strip().splitlines()
-    return [s for s in servers if pattern.lower() in s.lower()]
 
-def find_replace_list(list_name, find_str, replace_str):
-    """Replaces all occurrences of find_str with replace_str in the list."""
-    list_file = LIST_A_FILE if list_name.upper() == "A" else LIST_B_FILE
-    content = list_file.read_text()
-    new_content = content.replace(find_str, replace_str)
-    list_file.write_text(new_content)
-    return content != new_content
-
-# --- VPN Control ---
-def connect_to_server(server_id):
-    """Connects to a specific ProtonVPN server using CLI."""
-    try:
-        result = run(["protonvpn", "connect", server_id], check=True, stdout=PIPE, stderr=PIPE)
-        output = result.stdout.decode()
-        
-        # Extract server name from success message
-        # Format: "Connected to CH-HR#2 in Zagreb, Switzerland. Your new IP address is 178.218.167.211."
-        server_info = None
-        if "Connected to" in output:
-            # Get everything from "Connected to " to the next period
-            connected_part = output.split("Connected to ")[1]
-            server_info = connected_part.split(".")[0].strip()
-        
-        return True, output, server_info  # Return tuple with 3 elements now
-    except CalledProcessError as e:
-        return False, f"Failed to connect to {server_id}: {e.stderr.decode()}", None
-
-def disconnect_vpn():
-    """Disconnects from VPN."""
-    run(["protonvpn", "disconnect"], stdout=PIPE, stderr=PIPE)
-
-# --- Daemon Core ---
-class VPNRotatorDaemon:
-    def __init__(self):
-        self.config = load_config()
-        self.control_pipe = None
-        self.pipe_fd = None
-        self.shutdown = False
-        self.paused = self.config.get("paused", False)
-        self.current_connection = None
-
-    def disconnect_vpn(self):
-        """Disconnects from VPN and clears current connection info."""
-        run(["protonvpn", "disconnect"], stdout=PIPE, stderr=PIPE)
-        self.current_connection = None
-
-    def setup_control_pipe(self):
-        """Creates and opens a named pipe for receiving commands."""
-        if not os.path.exists(CONTROL_FILE):
-            os.mkfifo(CONTROL_FILE)
-        # Open pipe once and keep it open
-        self.pipe_fd = os.open(CONTROL_FILE, os.O_RDONLY | os.O_NONBLOCK)
-
-    def read_command(self):
-        """Reads a single command from the control pipe (non-blocking)."""
-        if self.pipe_fd is None:
-            return None
+def find_openvpn():
+    """PATH first, then Community, then the newest Proton bundled binary."""
+    found = shutil.which("openvpn")
+    if found:
+        return found
+    if WIN:
+        community = Path(r"C:\Program Files\OpenVPN\bin\openvpn.exe")
+        if community.exists():
+            return str(community)
+        proton = Path(r"C:\Program Files\Proton\VPN")
         try:
-            data = os.read(self.pipe_fd, 1024).decode('utf-8').strip()
-            return data if data else None
-        except BlockingIOError:
-            return None
-        except OSError as e:
-            # Pipe might have been closed on the other end
-            with open(LOG_FILE, 'a') as f:
-                f.write(f"{datetime.now()}: Error reading pipe: {str(e)}\n")
-            return None
+            for cand in sorted(proton.glob("**/openvpn.exe"),
+                               key=_version_key, reverse=True):
+                if cand.exists():
+                    return str(cand)
+        except OSError:
+            pass
+        return "openvpn"
+    return "/usr/sbin/openvpn"
 
-    def process_command(self, cmd):
-        """Processes commands from control pipe or signals."""
-        if not cmd:
-            return
-        parts = cmd.split()
-        if not parts:
-            return
 
-        action = parts[0].lower()
-        if action == "stop":
-            self.shutdown = True
-            self.config["running"] = False
-            save_config(self.config)
-            self.disconnect_vpn()
-        elif action == "pause":
-            self.paused = True
-            self.config["paused"] = True
-            save_config(self.config)
-        elif action == "resume":
-            self.paused = False
-            self.config["paused"] = False
-            save_config(self.config)
-        elif action == "switch" and len(parts) > 1:
-            new_list = parts[1].upper()
-            if new_list in ["A", "B"]:
-                self.config["active_list"] = new_list
-                self.config["current_index"] = 0  # Reset to start of new list
-                save_config(self.config)
-        elif action == "interval" and len(parts) > 1:
-            try:
-                minutes = int(parts[1])
-                if 1 <= minutes <= 1440:  # Reasonable bounds
-                    self.config["switch_interval_minutes"] = minutes
-                    save_config(self.config)
-            except ValueError:
-                pass
-        elif action == "skip":
-            self.config["current_index"] = (self.config.get("current_index", 0) + 1)
-            save_config(self.config)
-            self.disconnect_vpn()
-        elif action == "status":
-            self.log_status()
+OPENVPN = find_openvpn()
 
-    def log_status(self):
-        status = "RUNNING" if self.config["running"] else "STOPPED"
-        paused = "PAUSED" if self.paused else "ACTIVE"
-        active_list = self.config["active_list"]
-        interval = self.config["switch_interval_minutes"]
-        idx = self.config["current_index"]
-        servers = get_active_list(self.config)
-        current_server = self.current_connection if self.current_connection else "None"  # Use stored info
-        
-        log_msg = (f"[STATUS] Daemon: {status}, State: {paused}, "
-                f"Active List: {active_list}, Interval: {interval}min, "
-                f"Index: {idx}/{len(servers)}, Current VPN: {current_server}")
-        with open(LOG_FILE, 'a') as f:
-            f.write(f"{datetime.now()}: {log_msg}\n")
-        print(log_msg)
 
-    def run(self):
-        """Main daemon loop."""
-        self.config["running"] = True
-        save_config(self.config)
-        self.setup_control_pipe()
+# ---------------------------------------------------------------- utilities
+def log(msg):
+    line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+    try:
+        VAR.mkdir(parents=True, exist_ok=True)
+        with LOG.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
-        signal.signal(signal.SIGINT, lambda s, f: self.stop())
-        signal.signal(signal.SIGTERM, lambda s, f: self.stop())
 
-        with open(LOG_FILE, 'a') as log:
-            log.write(f"{datetime.now()}: Daemon started. Paused: {self.paused}, Active List: {self.config['active_list']}, Interval: {self.config['switch_interval_minutes']}min\n")
-
-        while not self.shutdown:
-            try:
-                # Check for commands
-                cmd = self.read_command()
-                if cmd:
-                    with open(LOG_FILE, 'a') as log:
-                        log.write(f"{datetime.now()}: Received command: {cmd}\n")
-                    self.process_command(cmd)
-
-                if self.shutdown:
-                    with open(LOG_FILE, 'a') as log:
-                        log.write(f"{datetime.now()}: Shutdown requested\n")
-                    break
-
-                if not self.paused:
-                    servers = get_active_list(self.config)
-                    if not servers:
-                        with open(LOG_FILE, 'a') as log:
-                            log.write(f"{datetime.now()}: No servers in list {self.config['active_list']}\n")
-                        time.sleep(10)
-                        continue
-
-                    idx = self.config.get("current_index", 0) % len(servers)
-                    server = servers[idx]
-
-                    # Log connection attempt
-                    with open(LOG_FILE, 'a') as log:
-                        log.write(f"{datetime.now()}: Connecting to server {idx+1}/{len(servers)}: {server}\n")
-
-                    # Connect
-                    success, msg, server_info = connect_to_server(server)  # Unpack 3 values
-                    now = datetime.now()
-                    with open(LOG_FILE, 'a') as log:
-                        log.write(f"{now}: Connection {'SUCCESS' if success else 'FAILED'}: {msg[:100]}\n")
-
-                    if success:
-                        # Store the current connection info
-                        self.current_connection = server_info if server_info else server
-                        # ... rest of the success handling
-                    else:
-                        self.current_connection = None
-                        # ... rest of the failure handling
-
-                    if success:
-                        # Wait for interval
-                        wait_start = datetime.now()
-                        interval_seconds = self.config["switch_interval_minutes"] * 60
-                        
-                        with open(LOG_FILE, 'a') as log:
-                            log.write(f"{datetime.now()}: Connected. Waiting {interval_seconds} seconds until {wait_start + timedelta(seconds=interval_seconds)}\n")
-                        
-                        # Wait loop
-                        elapsed = 0
-                        while elapsed < interval_seconds and not self.shutdown:
-                            time.sleep(5)  # Check every 5 seconds
-                            elapsed = (datetime.now() - wait_start).total_seconds()
-                            
-                            # Log progress every 30 seconds
-                            if int(elapsed) % 30 == 0:
-                                with open(LOG_FILE, 'a') as log:
-                                    log.write(f"{datetime.now()}: Waiting... {elapsed:.0f}/{interval_seconds}s elapsed\n")
-                            
-                            # Check for commands
-                            cmd = self.read_command()
-                            if cmd:
-                                with open(LOG_FILE, 'a') as log:
-                                    log.write(f"{datetime.now()}: Received command during wait: {cmd}\n")
-                                self.process_command(cmd)
-                                if self.shutdown or self.paused:
-                                    with open(LOG_FILE, 'a') as log:
-                                        log.write(f"{datetime.now()}: Breaking wait loop due to command\n")
-                                    break
-
-                        # Check why we exited the loop
-                        if self.shutdown:
-                            with open(LOG_FILE, 'a') as log:
-                                log.write(f"{datetime.now()}: Shutdown during wait\n")
-                            break
-                        elif self.paused:
-                            with open(LOG_FILE, 'a') as log:
-                                log.write(f"{datetime.now()}: Paused during wait\n")
-                            # Don't disconnect, stay connected but paused
-                            continue
-                        else:
-                            # Time's up - disconnect and move to next
-                            with open(LOG_FILE, 'a') as log:
-                                log.write(f"{datetime.now()}: Interval complete ({elapsed:.1f}s). Disconnecting...\n")
-                            
-                            self.disconnect_vpn()
-                            time.sleep(2)  # Give time for disconnect
-                            
-                            # Update index
-                            self.config["current_index"] = (idx + 1) % len(servers)
-                            save_config(self.config)
-                            
-                            with open(LOG_FILE, 'a') as log:
-                                log.write(f"{datetime.now()}: Moved to next server. New index: {self.config['current_index']}\n")
-                    else:
-                        # Connection failed - move to next server
-                        with open(LOG_FILE, 'a') as log:
-                            log.write(f"{datetime.now()}: Connection failed, moving to next server in 10s\n")
-                        
-                        self.config["current_index"] = (idx + 1) % len(servers)
-                        save_config(self.config)
-                        time.sleep(10)
-                else:
-                    # Paused state
-                    if int(time.time()) % 30 == 0:  # Log every 30 seconds when paused
-                        with open(LOG_FILE, 'a') as log:
-                            log.write(f"{datetime.now()}: Daemon paused. Current VPN: {self.current_connection}\n")
-                    time.sleep(1)
-                    
-            except Exception as e:
-                with open(LOG_FILE, 'a') as log:
-                    log.write(f"{datetime.now()}: ERROR in main loop: {str(e)}\n")
-                    import traceback
-                    log.write(traceback.format_exc() + "\n")
-                time.sleep(5)
-
-        # Cleanup at the end
-        self.config["running"] = False
-        save_config(self.config)
-        with open(LOG_FILE, 'a') as log:
-            log.write(f"{datetime.now()}: Daemon stopped\n")
-        
-        # Close pipe if open
-        if self.pipe_fd is not None:
-            os.close(self.pipe_fd)
-            self.pipe_fd = None
-            
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
-
-    def stop(self):
-        self.shutdown = True
-
-# --- CLI Control Interface ---
-def send_command(cmd):
-    """Sends a command to the daemon via the named pipe."""
-    if not os.path.exists(CONTROL_FILE):
-        print("Daemon control pipe not found. Is the daemon running?")
-        return False
-    
-    # Try multiple times since pipe might be temporarily closed
-    for _ in range(3):
+def write_atomic(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    for _ in range(5):
         try:
-            with open(CONTROL_FILE, 'w', encoding='utf-8') as pipe:
-                pipe.write(cmd + "\n")
-            return True
-        except BrokenPipeError:
-            time.sleep(0.1)  # Short delay before retry
-            continue
-        except Exception as e:
-            print(f"Error sending command: {e}")
-            return False
-    
-    print("Failed to send command after multiple attempts.")
-    print("Try restarting the daemon: ./pvpn-rotator.py stop && ./pvpn-rotator.py start")
-    return False
+            os.replace(tmp, path)
+            return
+        except PermissionError:      # Windows: target briefly locked
+            time.sleep(0.1)
+    tmp.unlink(missing_ok=True)
 
-def cli_control():
-    """Handles user commands from terminal."""
-    if len(sys.argv) < 2:
-        print("Usage: pvpn-rotate <command> [args]")
-        print("Commands:")
-        print("  start                 - Start the daemon")
-        print("  stop                  - Stop the daemon")
-        print("  pause                 - Pause rotation")
-        print("  resume                - Resume rotation")
-        print("  switch <A|B>          - Switch active list")
-        print("  interval <minutes>    - Set switch interval")
-        print("  skip                  - Skip to next server")
-        print("  status                - Show current status")
-        print("  list <A|B>            - Show servers in list")
-        print("  search <A|B> <pattern>- Search list for pattern")
-        print("  add <A|B> <server>    - Add server to list")
-        print("  remove <A|B> <server> - Remove server from list")
-        print("  replace <A|B> <find> <replace> - Find and replace")
+
+def write_cmd(text):
+    """Direct write - keeps the ACL that atomic replace would discard."""
+    CMD.parent.mkdir(parents=True, exist_ok=True)
+    CMD.write_text(text, encoding="utf-8")
+
+
+def clear_cmd():
+    try:
+        CMD.write_text("", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_json(path, default):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return dict(default)
+
+
+def save_json(path, data):
+    write_atomic(path, json.dumps(data, indent=2))
+
+
+def servers():
+    if not OVPN_DIR.is_dir():
+        return []
+    return sorted(p for p in OVPN_DIR.iterdir() if p.suffix.lower() == ".ovpn")
+
+
+def read_state():
+    return load_json(STATE, {"index": 0, "paused": False, "current": None})
+
+
+def save_state(st):
+    save_json(STATE, st)
+
+
+def tail(path, n=25):
+    try:
+        return "\n".join(path.read_text(errors="replace").splitlines()[-n:])
+    except OSError:
+        return ""
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def require_admin():
+    if WIN:
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            return
+        args = " ".join(f'"{a}"' for a in [os.path.abspath(__file__), *sys.argv[1:]])
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, args, None, 1)
+        sys.exit(0)
+    if os.geteuid() == 0:
         return
+    os.execvp("sudo", ["sudo", sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
 
-    command = sys.argv[1].lower()
 
-    if command == "start":
-        # Run as daemon
-        daemon = VPNRotatorDaemon()
-        # Write PID file
-        with open(PID_FILE, 'w') as f:
-            f.write(str(os.getpid()))
-        daemon.run()
-    elif command in ["stop", "pause", "resume", "skip", "status"]:
-        send_command(command)
-        if command == "status":
-            time.sleep(0.5)  # Give daemon time to log
-            if LOG_FILE.exists():
-                with open(LOG_FILE, 'r') as f:
-                    lines = f.readlines()
-                    if lines:
-                        print(lines[-1].strip())
-    elif command == "switch" and len(sys.argv) == 3:
-        send_command(f"switch {sys.argv[2]}")
-    elif command == "interval" and len(sys.argv) == 3:
-        send_command(f"interval {sys.argv[2]}")
-    elif command == "list" and len(sys.argv) == 3:
-        config = load_config()
-        servers = get_active_list({"active_list": sys.argv[2].upper()})
-        print(f"List {sys.argv[2].upper()} ({len(servers)} servers):")
-        for i, s in enumerate(servers):
-            print(f"  {i+1}. {s}")
-    elif command == "search" and len(sys.argv) == 4:
-        results = search_list(sys.argv[2], sys.argv[3])
-        print(f"Found {len(results)} matches:")
-        for r in results:
-            print(f"  {r}")
-    elif command == "add" and len(sys.argv) == 4:
-        list_name = sys.argv[2]
-        server = sys.argv[3]
-        list_file = LIST_A_FILE if list_name.upper() == "A" else LIST_B_FILE
-        with open(list_file, 'a') as f:
-            f.write(server + "\n")
-        print(f"Added '{server}' to list {list_name.upper()}")
-    elif command == "remove" and len(sys.argv) == 4:
-        list_name = sys.argv[2]
-        server = sys.argv[3]
-        list_file = LIST_A_FILE if list_name.upper() == "A" else LIST_B_FILE
-        servers = list_file.read_text().strip().splitlines()
-        if server in servers:
-            servers.remove(server)
-            list_file.write_text("\n".join(servers) + "\n")
-            print(f"Removed '{server}' from list {list_name.upper()}")
+# ---------------------------------------------------------------- kill switch
+def ks_on(host, port, proto):
+    iface = load_json(CONF, DEFAULTS).get("tun_iface", "tun*")
+    try:
+        ip = socket.gethostbyname(host)
+    except OSError:
+        log(f"killswitch: cannot resolve {host}, skipping")
+        return
+    if WIN:
+        subprocess.run(["netsh", "advfirewall", "set", "allprofiles",
+                        "firewallpolicy", "blockinbound,blockoutbound"],
+                       capture_output=True)
+        subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule",
+                        "name=pvpn-ks-tun", "dir=out", "action=allow",
+                        f'interface="{iface}"', "enable=yes"], capture_output=True)
+        subprocess.run(["netsh", "advfirewall", "firewall", "add", "rule",
+                        "name=pvpn-ks-srv", "dir=out", "action=allow",
+                        f"remoteip={ip}", "enable=yes"], capture_output=True)
+    else:
+        rules = f"""
+            add table inet pvpn
+            add chain inet pvpn out {{ type filter hook output priority 0; policy drop; }}
+            add rule inet pvpn out ct state established,related accept
+            add rule inet pvpn out oifname "lo" accept
+            add rule inet pvpn out oifname "{iface}" accept
+            add rule inet pvpn out ip daddr {ip} {proto} dport {port} accept
+            add rule inet pvpn out udp dport 67 accept
+            add rule inet pvpn out udp dport 53 accept
+        """
+        r = subprocess.run(["nft", "-f", "-"], input=rules, text=True,
+                           capture_output=True)
+        if r.returncode:
+            log(f"killswitch: nft failed: {r.stderr.strip()}")
+
+
+def ks_off():
+    if WIN:
+        subprocess.run(["netsh", "advfirewall", "set", "allprofiles",
+                        "firewallpolicy", "blockinbound,allowoutbound"],
+                       capture_output=True)
+        for n in ("pvpn-ks-tun", "pvpn-ks-srv"):
+            subprocess.run(["netsh", "advfirewall", "firewall", "delete", "rule",
+                            f"name={n}"], capture_output=True)
+    else:
+        subprocess.run(["nft", "delete", "table", "inet", "pvpn"], capture_output=True)
+
+
+# ---------------------------------------------------------------- management
+def _q(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+class Mgmt:
+    """Minimal OpenVPN management client. Identical path on both platforms."""
+
+    def __init__(self, port, timeout):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        self.buf = b""
+
+    def line(self):
+        while b"\n" not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("management socket closed")
+            self.buf += chunk
+        raw, self.buf = self.buf.split(b"\n", 1)
+        return raw.decode(errors="replace").strip()
+
+    def send(self, cmd):
+        self.sock.sendall(cmd.encode() + b"\n")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def _attach(port, deadline):
+    """Wait for openvpn to open the management port."""
+    while time.time() < deadline:
+        try:
+            m = Mgmt(port, 5)
+        except OSError:
+            time.sleep(0.25)
+            continue
+        while time.time() < deadline:
+            try:
+                if "OpenVPN Management Interface" in m.line():
+                    return m
+            except (ConnectionError, socket.timeout):
+                break
+        m.close()
+        time.sleep(0.25)
+    return None
+
+
+# ---------------------------------------------------------------- openvpn
+def parse_remote(cfg):
+    for line in cfg.read_text(errors="replace").splitlines():
+        p = line.split()
+        if p and p[0] == "remote" and len(p) >= 2:
+            port = int(p[2]) if len(p) > 2 and p[2].isdigit() else 1194
+            proto = "udp" if ("udp" in p[3:] or "udp" in cfg.name) else "tcp"
+            return p[1], port, proto
+    return None, 1194, "udp"
+
+
+def kill_child(timeout=15):
+    global _child, _mgmt
+    if _mgmt:
+        try:
+            _mgmt.send("signal SIGTERM")
+        except OSError:
+            pass
+    if _child is not None and _child.poll() is None:
+        try:
+            _child.wait(timeout)
+        except subprocess.TimeoutExpired:
+            _child.kill()
+            _child.wait(5)
+    if _mgmt:
+        _mgmt.close()
+        _mgmt = None
+    _child = None
+
+
+def connect(cfg, timeout):
+    global _child, _mgmt
+    try:
+        creds = CREDS.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        log(f"missing credentials file {CREDS}")
+        return False
+    if len(creds) < 2 or creds[0].startswith("OPENVPN_"):
+        log(f"fill in {CREDS} first")
+        return False
+    user, password = creds[0].strip(), creds[1].strip()
+
+    settings = load_json(CONF, DEFAULTS)
+    port = free_port()
+    try:
+        OVPN_LOG.unlink(missing_ok=True)
+    except PermissionError:
+        pass
+    args = [OPENVPN, "--config", str(cfg),
+            "--management", "127.0.0.1", str(port),
+            "--management-hold", "--management-query-passwords",
+            "--script-security", "2", "--verb", "3",
+            "--log", str(OVPN_LOG), "--writepid", str(VAR / "openvpn.pid")]
+
+    node = settings.get("dev_node")
+    if WIN:
+        args += ["--windows-driver", "tap-windows6", "--disable-dco"]
+        if node:
+            args += ["--dev-node", node]
+    if not WIN and RESOLV.exists():
+        args += ["--up", str(RESOLV), "--down", str(RESOLV), "--up-restart"]
+
+    host, vport, proto = parse_remote(cfg)
+    if host and settings.get("killswitch"):
+        ks_on(host, vport, proto)
+
+    log(f"connecting to {cfg.name}")
+    _child = subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.STDOUT,
+                              creationflags=NO_WINDOW)
+
+    deadline = time.time() + timeout
+    _mgmt = _attach(port, deadline)
+    if _mgmt is None:
+        log("management interface never came up")
+        kill_child()
+        return False
+
+    try:
+        _mgmt.send("state on")
+        _mgmt.send("hold release")
+        while time.time() < deadline:
+            if _child.poll() is not None:
+                log(f"openvpn exited rc={_child.returncode}: {tail(OVPN_LOG, 6)}")
+                kill_child()
+                return False
+            try:
+                line = _mgmt.line()
+            except socket.timeout:
+                continue
+            except ConnectionError:
+                log("management socket closed")
+                kill_child()
+                return False
+
+            if line.startswith(">PASSWORD:Need"):
+                key = re.search(r"Need '([^']+)'", line)
+                if key:
+                    _mgmt.send(f"username {_q(key.group(1))} {_q(user)}")
+                    _mgmt.send(f"password {_q(key.group(1))} {_q(password)}")
+            elif "Verification Failed" in line or "AUTH_FAILED" in line:
+                log("AUTH_FAILED - use the OpenVPN username/password, not the account password")
+                kill_child()
+                return False
+            elif line.startswith(">STATE:") and ",CONNECTED,SUCCESS," in line:
+                return True
+            elif line.startswith(">STATE:") and ",EXITING," in line:
+                log(f"state: {line}")
+                kill_child()
+                return False
+        log(f"connect timed out after {timeout}s: {tail(OVPN_LOG, 6)}")
+        kill_child()
+        return False
+    except OSError as e:
+        log(f"management error: {e}")
+        kill_child()
+        return False
+
+
+def public_ip():
+    try:
+        req = urllib.request.Request("https://ipinfo.io/ip",
+                                     headers={"User-Agent": "pvpn-rotator"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.read().decode().strip() or None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- rotation
+def rotate_once(st, cfg):
+    """Returns 'rotated' | 'next' | 'failed' | 'stop'."""
+    files = servers()
+    if not files:
+        log(f"no .ovpn files in {OVPN_DIR}")
+        return "failed"
+
+    if cfg.get("order") == "random":
+        idx = random.randrange(len(files))
+    else:
+        idx = st["index"] % len(files)
+
+    if not connect(files[idx], cfg["connect_timeout"]):
+        return "failed"
+
+    st["current"] = files[idx].name
+    save_state(st)
+    if cfg.get("verify_ip"):
+        log(f"connected, exit IP {public_ip() or 'unknown'}")
+
+    start = datetime.now()
+    last = 0
+    while True:
+        if _stop:
+            return "stop"
+        handle_command(st, cfg)
+        if st.get("paused"):
+            start = datetime.now()
+            time.sleep(2)
+            continue
+        if st.pop("_next", False):
+            save_state(st)
+            log("manual switch requested")
+            return "next"
+        if _child is None or _child.poll() is not None:
+            log("tunnel dropped, reconnecting")
+            kill_child()
+            return "failed"
+        elapsed = int((datetime.now() - start).total_seconds())
+        if elapsed >= cfg["interval_minutes"] * 60:
+            return "rotated"
+        if elapsed - last >= 30:
+            log(f"{elapsed}s / {cfg['interval_minutes'] * 60}s on {files[idx].name}")
+            last = elapsed
+        time.sleep(1)
+
+
+def handle_command(st, cfg):
+    if not CMD.exists():
+        return
+    try:
+        raw = CMD.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if not raw:
+        return
+    clear_cmd()
+    log(f"command: {raw}")
+    verb, _, arg = raw.partition(" ")
+    if verb == "pause":
+        st["paused"] = True
+    elif verb == "resume":
+        st["paused"] = False
+    elif verb == "next":
+        st["_next"] = True
+        kill_child()
+    elif verb == "stop":
+        global _stop
+        _stop = True
+    elif verb == "interval" and arg.isdigit() and 1 <= int(arg) <= 1440:
+        cfg["interval_minutes"] = int(arg)
+        save_json(CONF, cfg)
+    save_state(st)
+
+
+def daemon():
+    global _stop
+    cfg = load_json(CONF, DEFAULTS)
+    st = read_state()
+    st["paused"] = False
+    st.pop("_next", None)
+    save_state(st)
+
+    def bye(*_):
+        global _stop
+        _stop = True
+
+    for sig in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        if hasattr(signal, sig):
+            try:
+                signal.signal(getattr(signal, sig), bye)
+            except (ValueError, OSError):
+                pass
+
+    log(f"daemon start ({PLATFORM}): interval={cfg['interval_minutes']}m "
+        f"files={len(servers())} openvpn={OPENVPN}")
+    backoff = 5
+    while not _stop:
+        result = rotate_once(st, cfg)
+        kill_child()
+        ks_off()
+        if _stop or result == "stop":
+            break
+        n = max(len(servers()), 1)
+        if result in ("rotated", "next"):
+            backoff = 5
+            st["index"] = (st["index"] + 1) % n
+            save_state(st)
         else:
-            print(f"Server '{server}' not found in list {list_name.upper()}")
-    elif command == "replace" and len(sys.argv) == 5:
-        changed = find_replace_list(sys.argv[2], sys.argv[3], sys.argv[4])
-        print(f"Find/replace {'performed' if changed else 'no changes'}")
+            st["index"] = (st["index"] + 1) % n
+            save_state(st)
+            log(f"rotation failed, retry in {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
 
-# --- Systemd Service Setup ---
-def create_systemd_service():
-    """Creates a systemd user service file for autostart."""
-    service_content = f"""[Unit]
-Description=ProtonVPN Server Rotator
+    kill_child()
+    ks_off()
+    st["current"] = None
+    st.pop("_next", None)
+    save_state(st)
+    log("daemon stopped")
+
+
+# ---------------------------------------------------------------- CLI
+def cmd_init():
+    for d in (ETC, VAR, OVPN_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+    if not CONF.exists():
+        save_json(CONF, DEFAULTS)
+    if not CREDS.exists():
+        write_atomic(CREDS, "OPENVPN_USERNAME\nOPENVPN_PASSWORD\n")
+        try:
+            CREDS.chmod(0o600)
+        except OSError:
+            pass
+
+    # control channel: writable by ordinary users so `next` needs no UAC/sudo
+    CMD.touch(exist_ok=True)
+    if WIN:
+        r = subprocess.run(["icacls", str(CMD), "/grant", "*S-1-5-32-545:(M)"],
+                           capture_output=True, text=True)
+        if r.returncode:
+            print(f"warning: icacls failed: {r.stderr.strip()}")
+    else:
+        CMD.chmod(0o666)
+
+    print(f"Config:  {ETC}")
+    print(f"Configs: {OVPN_DIR}   <- put {PLATFORM} .ovpn files here")
+    print(f"Creds:   {CREDS}   <- OpenVPN username, then password")
+    print(f"Binary:  {OPENVPN}")
+    if WIN and not Path(OPENVPN).exists():
+        print("warning: openvpn binary not found")
+
+
+def cmd_status():
+    st = read_state()
+    cfg = load_json(CONF, DEFAULTS)
+    if WIN:
+        r = subprocess.run(["schtasks", "/query", "/tn", "pvpn-rotator"],
+                           capture_output=True, text=True)
+        running = "Running" in r.stdout
+    else:
+        running = subprocess.run(["systemctl", "is-active", "--quiet",
+                                  "pvpn-rotator"]).returncode == 0
+    print(f"platform: {PLATFORM}")
+    print(f"binary:   {OPENVPN}")
+    print(f"service:  {'running' if running else 'stopped'}")
+    print(f"paused:   {st.get('paused')}")
+    print(f"current:  {st.get('current') or 'none'}")
+    print(f"index:    {st['index']} / {len(servers())}")
+    print(f"interval: {cfg['interval_minutes']} min")
+    print(f"order:    {cfg.get('order')}")
+    print(f"dev node: {cfg.get('dev_node') or '-'}")
+    print(f"killswitch: {cfg.get('killswitch')}")
+    print(f"exit IP:  {public_ip() or 'unknown'}")
+    if OVPN_LOG.exists():
+        print("\nlast openvpn lines:")
+        print(tail(OVPN_LOG, 5))
+
+
+def cmd_send(verb, arg=""):
+    if not VAR.is_dir():
+        print("run init first")
+        return
+    write_cmd(f"{verb} {arg}".strip() + "\n")
+    print(f"sent: {verb} {arg}".strip())
+
+
+def cmd_servers():
+    files = servers()
+    if not files:
+        print(f"no .ovpn files in {OVPN_DIR}")
+        return
+    st = read_state()
+    cur = st["index"] % len(files)
+    for i, f in enumerate(files):
+        print(f"{'->' if i == cur else '  '} {i}: {f.name}")
+
+
+def cmd_install():
+    script = os.path.abspath(__file__)
+    if WIN:
+        tr = f'"{sys.executable}" "{script}" daemon'
+        r = subprocess.run(["schtasks", "/create", "/tn", "pvpn-rotator",
+                            "/tr", tr, "/sc", "onstart", "/ru", "SYSTEM",
+                            "/rl", "HIGHEST", "/f"],
+                           capture_output=True, text=True)
+        print(r.stdout or r.stderr)
+        print("start now with: schtasks /run /tn pvpn-rotator")
+        return
+    unit = f"""[Unit]
+Description=Proton VPN OpenVPN rotator
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={sys.executable} {os.path.abspath(__file__)} start
-Restart=on-failure
-RestartSec=5
-StandardOutput=append:{LOG_FILE}
-StandardError=inherit
+ExecStart={sys.executable} {script} daemon
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 """
-    service_dir = Path.home() / ".config" / "systemd" / "user"
-    service_dir.mkdir(parents=True, exist_ok=True)
-    service_file = service_dir / "pvpn-rotator.service"
-    service_file.write_text(service_content)
-    print(f"Systemd service file created at {service_file}")
-    print("To enable autostart on boot, run:")
-    print(f"  systemctl --user enable pvpn-rotator.service")
-    print("To start now:")
-    print(f"  systemctl --user start pvpn-rotator.service")
+    path = Path("/etc/systemd/system/pvpn-rotator.service")
+    write_atomic(path, unit)
+    subprocess.run(["systemctl", "daemon-reload"])
+    print(f"wrote {path}")
+    print("enable with: systemctl enable --now pvpn-rotator")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="pvpn-rotator")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("init", "daemon", "status", "servers", "install-service",
+                 "pause", "resume", "next", "stop"):
+        sub.add_parser(name)
+    sub.add_parser("interval").add_argument("minutes", type=int)
+    a = p.parse_args()
+
+    if a.cmd == "status":
+        return cmd_status()
+    if a.cmd in ADMIN_CMDS:
+        require_admin()
+
+    if a.cmd == "daemon":
+        return daemon()
+    if a.cmd == "init":
+        return cmd_init()
+    if a.cmd == "servers":
+        return cmd_servers()
+    if a.cmd == "install-service":
+        return cmd_install()
+    if a.cmd == "interval":
+        return cmd_send("interval", str(a.minutes))
+    cmd_send(a.cmd)
+
 
 if __name__ == "__main__":
-    if len(sys.argv) == 2 and sys.argv[1] == "install-service":
-        create_systemd_service()
-    else:
-        cli_control()
+    main()
